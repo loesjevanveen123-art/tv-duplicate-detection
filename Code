@@ -1,0 +1,756 @@
+##############################
+# Libraries
+##############################
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(digest)
+library(ggplot2)
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+##############################
+# 1. Data loading & preprocessing
+##############################
+
+json_path <- "/Users/loesvanveen/Downloads/TVs-all-merged.json"
+
+# Read as nested list
+tv_json <- fromJSON(json_path, simplifyVector = FALSE)
+
+# Flatten (each element is one product record)
+tv_list <- purrr::flatten(tv_json)
+length(tv_list)  # should be 1624
+
+# Build flat data frame
+tv_df <- map_dfr(tv_list, function(x) {
+  features <- x$featuresMap
+  
+  feature_vals <- if (!is.null(features)) {
+    paste(unlist(features), collapse = " ")
+  } else {
+    ""
+  }
+  
+  tibble(
+    shop    = x$shop    %||% NA_character_,
+    modelID = x$modelID %||% NA_character_,
+    title   = x$title   %||% NA_character_,
+    features_text = feature_vals
+  )
+})
+
+tv_df <- tv_df %>%
+  mutate(id = row_number())
+
+nrow(tv_df)
+
+# Text preprocessing (global normalization)
+preprocess_text <- function(x) {
+  x %>%
+    tolower() %>%
+    str_replace_all("[^a-z0-9]", " ") %>%  # everything except letters/digits -> space
+    str_replace_all("\\s+", " ") %>%
+    str_squish()
+}
+
+tv_df <- tv_df %>%
+  mutate(
+    full_text_raw = paste(title, features_text, sep = " "),
+    full_text = preprocess_text(full_text_raw)
+  )
+
+##############################
+# 2. Product representation: tokens (voor MinHash/LSH)
+##############################
+
+# Extract tokens per product:
+extract_tokens <- function(txt) {
+  if (is.na(txt) || txt == "") return(character(0))
+  
+  txt <- tolower(txt)
+  txt <- gsub("[^a-z0-9]", " ", txt)
+  txt <- gsub("\\s+", " ", txt)
+  txt <- str_squish(txt)
+  
+  words <- unlist(str_split(txt, " "))
+  words <- words[nchar(words) >= 2]
+  
+  if (length(words) < 2) return(words)
+  
+  token_pairs <- vapply(
+    1:(length(words)-1),
+    function(i) paste(words[i], words[i+1], sep = "_"),
+    FUN.VALUE = character(1)
+  )
+  
+  unique(token_pairs)
+}
+
+# Tokens per product
+tv_tokens <- map(tv_df$full_text, extract_tokens)
+
+# Vocabulary + token-id sets
+all_tokens <- unique(unlist(tv_tokens))
+vocab <- setNames(seq_along(all_tokens), all_tokens)
+
+tv_token_ids <- map(tv_tokens, ~ {
+  if (length(.x) == 0) integer(0) else unique(vocab[.x])
+})
+
+##############################
+# 2b. Extra structures for MSM
+##############################
+
+# 2b.1. Key–value structure per product (tv_list)
+kv_list <- lapply(tv_list, function(rec) {
+  feats <- rec$featuresMap
+  if (is.null(feats)) return(list())
+  # elke value -> één string
+  purrr::map(feats, ~ paste(unlist(.x), collapse = " "))
+})
+
+# Helper: Jaccard (sets)
+jaccard_set <- function(a, b) {
+  if ((length(a) == 0) && (length(b) == 0)) return(0)
+  inter <- length(intersect(a, b))
+  uni   <- length(union(a, b))
+  if (uni == 0) return(0)
+  inter / uni
+}
+
+# Helper: q-gram tokens (for q-gram; matching key–value pairs)
+qgram_tokens <- function(x, q = 3) {
+  x <- tolower(x)
+  x <- gsub("\\s+", " ", x)
+  x <- trimws(x)
+  if (nchar(x) < q) return(character(0))
+  n <- nchar(x)
+  vapply(
+    seq_len(n - q + 1L),
+    function(i) substr(x, i, i + q - 1L),
+    character(1)
+  )
+}
+
+# 2b.2. Model words
+# Title model words
+extract_title_model_words <- function(s) {
+  if (is.na(s) || s == "") return(character(0))
+  tokens <- unlist(strsplit(tolower(s), "\\s+"))
+  tokens[grepl("[0-9]", tokens) & grepl("[a-z]", tokens)]
+}
+
+# Value model words
+extract_value_model_words <- function(s) {
+  if (is.na(s) || s == "") return(character(0))
+  tokens <- unlist(strsplit(tolower(s), "\\s+"))
+  # numeric/decimal or numeric/decimal + letters (unit)
+  is_num_only   <- grepl("^\\d+(\\.\\d+)?$", tokens)
+  is_num_with_u <- grepl("^\\d+(\\.\\d+)?[a-z]+$", tokens)
+  
+  mw <- tokens[is_num_only | is_num_with_u]
+  # unit -> only value
+  mw <- sub("^([0-9]+(\\.[0-9]+)?)[a-z]+$", "\\1", mw)
+  unique(mw)
+}
+
+# 2b.3. Precompute model words per product
+title_mw <- lapply(tv_df$title, extract_title_model_words)
+
+value_mw <- lapply(kv_list, function(kv) {
+  if (length(kv) == 0) return(character(0))
+  vals <- paste(unlist(kv), collapse = " ")
+  extract_value_model_words(vals)
+})
+
+##############################
+# 2c. MSM-similariteit
+##############################
+
+# MSM = w1 * s_kv_match + w2 * s_kv_model + w3 * s_title
+# - s_kv_match: q-gram Jaccard similarity on values of matching attribute keys
+# - s_kv_model: Jaccard similarity on value model words
+# - s_title   : Jaccard similarity on title model words
+# Equal weights
+msm_sim <- function(id1, id2,
+                    w1 = 1/3, w2 = 1/3, w3 = 1/3,
+                    q  = 3) {
+  # 1) matching key–value pairs (q-gram overlap)
+  kv1 <- kv_list[[id1]]
+  kv2 <- kv_list[[id2]]
+  
+  s_kv_match <- 0
+  if (!is.null(kv1) && !is.null(kv2) &&
+      length(kv1) > 0 && length(kv2) > 0) {
+    common_keys <- intersect(names(kv1), names(kv2))
+    if (length(common_keys) > 0) {
+      sims <- vapply(common_keys, function(k) {
+        v1 <- kv1[[k]]
+        v2 <- kv2[[k]]
+        q1 <- qgram_tokens(v1, q = q)
+        q2 <- qgram_tokens(v2, q = q)
+        jaccard_set(q1, q2)
+      }, numeric(1))
+      if (length(sims) > 0) {
+        s_kv_match <- mean(sims)
+      }
+    }
+  }
+  
+  # 2) model words
+  mw1 <- value_mw[[id1]]
+  mw2 <- value_mw[[id2]]
+  s_kv_model <- jaccard_set(mw1, mw2)
+  
+  # 3) title model words
+  tmw1 <- title_mw[[id1]]
+  tmw2 <- title_mw[[id2]]
+  s_title <- jaccard_set(tmw1, tmw2)
+  
+  # combinated MSM-similarity
+  sim <- w1 * s_kv_match + w2 * s_kv_model + w3 * s_title
+  sim
+}
+
+##############################
+# 3. MinHash implementation
+##############################
+
+# Generate MinHash parameters once
+generate_minhash_params <- function(n_tokens, n_hash = 100, seed = 42) {
+  set.seed(seed)
+  
+  next_prime <- function(n) {
+    is_prime <- function(k) {
+      if (k < 2) return(FALSE)
+      if (k == 2) return(TRUE)
+      if (k %% 2 == 0) return(FALSE)
+      for (i in 3:floor(sqrt(k))) {
+        if (i * i > k) break
+        if (k %% i == 0) return(FALSE)
+      }
+      TRUE
+    }
+    while (!is_prime(n)) n <- n + 1
+    n
+  }
+  
+  P <- next_prime(2 * n_tokens + 1)
+  a <- sample(1:(P - 1), n_hash, replace = TRUE)
+  b <- sample(0:(P - 1), n_hash, replace = TRUE)
+  
+  list(a = a, b = b, P = P)
+}
+
+# Compute MinHash signature matrix (n_hash x n_items)
+minhash_signature <- function(token_id_list, a, b, P) {
+  n_hash  <- length(a)
+  n_items <- length(token_id_list)
+  
+  sig_mat <- matrix(Inf, nrow = n_hash, ncol = n_items)
+  
+  for (j in seq_len(n_items)) {
+    ids <- token_id_list[[j]]
+    if (length(ids) == 0L) next
+    
+    # Vectorized hashing: n_hash x |ids|
+    hvals <- (outer(a, ids, `*`) + b) %% P
+    sig_mat[, j] <- apply(hvals, 1, min)
+  }
+  
+  sig_mat
+}
+
+# Global MinHash params
+N_HASH <- 100
+mh_params <- generate_minhash_params(length(vocab), n_hash = N_HASH, seed = 123)
+
+##############################
+# 4. LSH (banding) + theory functions
+##############################
+
+# LSH theory
+# P( at least one common bucket ) = 1 - (1 - s^r)^b
+lsh_prob_same_bucket <- function(s, b, r) {
+  1 - (1 - s^r)^b
+}
+
+# Helper to generate the LSH curve for plotting in paper
+lsh_curve <- function(b, r, s_vals = seq(0, 1, by = 0.01)) {
+  tibble(
+    s = s_vals,
+    p_same_bucket = lsh_prob_same_bucket(s_vals, b = b, r = r)
+  )
+}
+
+# LSH banding: generate candidate pairs
+lsh_candidate_pairs <- function(sig_mat, bands, rows_per_band) {
+  n_hash  <- nrow(sig_mat)
+  n_items <- ncol(sig_mat)
+  
+  stopifnot(n_hash == bands * rows_per_band)
+  
+  cand_list <- vector("list", bands)
+  
+  for (b in seq_len(bands)) {
+    row_start <- (b - 1) * rows_per_band + 1
+    row_end   <- b * rows_per_band
+    
+    band_block <- sig_mat[row_start:row_end, , drop = FALSE]
+    
+    # Hash band signatures to compact keys
+    band_keys <- apply(band_block, 2, function(col) {
+      digest(col, algo = "xxhash64")
+    })
+    
+    df_band <- tibble(
+      item = seq_len(n_items),
+      band_key = band_keys
+    ) %>%
+      group_by(band_key) %>%
+      filter(n() > 1) %>%
+      summarise(items = list(item), .groups = "drop")
+    
+    if (nrow(df_band) > 0) {
+      pairs_band <- map(df_band$items, function(vec) {
+        if (length(vec) < 2) return(NULL)
+        combn(vec, 2) %>% t() %>% as.data.frame()
+      }) %>%
+        bind_rows()
+      
+      if (nrow(pairs_band) > 0) {
+        colnames(pairs_band) <- c("i", "j")
+        cand_list[[b]] <- pairs_band
+      }
+    }
+  }
+  
+  # purrr::compact to remove NULLs
+  if (length(purrr::compact(cand_list)) == 0) {
+    return(tibble(i = integer(0), j = integer(0)))
+  }
+  
+  bind_rows(cand_list) %>%
+    mutate(
+      i = pmin(i, j),
+      j = pmax(i, j)
+    ) %>%
+    distinct(i, j)
+}
+
+##############################
+# 5. Gold labels (duplicates)
+##############################
+
+# Gold duplicates: same non-empty modelID
+is_duplicate_pair_vec <- function(i_vec, j_vec, model_ids) {
+  mi <- model_ids[i_vec]
+  mj <- model_ids[j_vec]
+  same <- (mi == mj)
+  valid <- !is.na(mi) & !is.na(mj) & mi != ""
+  same & valid
+}
+
+##############################
+# 6. Metrics for one test subset
+##############################
+
+compute_metrics_for_test <- function(test_idx,
+                                     cand_pairs_local, # with i_local, j_local, pred_dup
+                                     token_ids_test,   # list for test subset (hier niet meer gebruikt voor sim)
+                                     modelID_global,
+                                     test_to_global) {
+  # Map local indices to global
+  i_global <- test_to_global[cand_pairs_local$i_local]
+  j_global <- test_to_global[cand_pairs_local$j_local]
+  
+  cand_pairs_global <- cand_pairs_local %>%
+    mutate(
+      i_global = i_global,
+      j_global = j_global
+    )
+  
+  # Universe van paren binnen test set
+  pairs_mat <- combn(test_idx, 2)
+  i_all <- pairs_mat[1, ]
+  j_all <- pairs_mat[2, ]
+  
+  total_pairs_b <- length(i_all)
+  
+  gold_dup_all <- is_duplicate_pair_vec(i_all, j_all, modelID_global)
+  total_true_dups_b <- sum(gold_dup_all)
+  
+  # Predicted duplicates: match keys
+  pred_keys <- sprintf("%d_%d",
+                       pmin(cand_pairs_global$i_global, cand_pairs_global$j_global),
+                       pmax(cand_pairs_global$i_global, cand_pairs_global$j_global))
+  pred_keys <- pred_keys[cand_pairs_global$pred_dup]  # only predicted duplicates
+  
+  all_keys  <- sprintf("%d_%d", pmin(i_all, j_all), pmax(i_all, j_all))
+  match_idx <- match(all_keys, pred_keys)
+  pred_dup_all <- !is.na(match_idx)
+  
+  TPb <- sum(pred_dup_all & gold_dup_all)
+  FPb <- sum(pred_dup_all & !gold_dup_all)
+  FNb <- sum(!pred_dup_all & gold_dup_all)
+  TNb <- sum(!pred_dup_all & !gold_dup_all)
+  
+  precision_b <- ifelse(TPb + FPb == 0, 0, TPb / (TPb + FPb))
+  recall_b    <- ifelse(TPb + FNb == 0, 0, TPb / (TPb + FNb))
+  F1_b        <- ifelse(precision_b + recall_b == 0, 0,
+                        2 * precision_b * recall_b / (precision_b + recall_b))
+  
+  comparisons_made_b <- nrow(cand_pairs_global)
+  pair_quality_b     <- ifelse(comparisons_made_b == 0, 0, TPb / comparisons_made_b)
+  pair_compl_b       <- ifelse(total_true_dups_b == 0, 0, TPb / total_true_dups_b)
+  F1_star_b          <- ifelse(pair_quality_b + pair_compl_b == 0, 0,
+                               2 * pair_quality_b * pair_compl_b /
+                                 (pair_quality_b + pair_compl_b))
+  comp_fraction_b    <- ifelse(total_pairs_b == 0, 0, comparisons_made_b / total_pairs_b)
+  
+  tibble(
+    TP = TPb, FP = FPb, FN = FNb, TN = TNb,
+    precision = precision_b,
+    recall = recall_b,
+    F1 = F1_b,
+    pair_quality = pair_quality_b,
+    pair_completeness = pair_compl_b,
+    F1_star = F1_star_b,
+    comparisons_made = comparisons_made_b,
+    comparison_fraction = comp_fraction_b
+  )
+}
+
+##############################
+# 7. Bootstrapping (MSM)
+##############################
+
+run_bootstrap <- function(tv_df,
+                          tv_token_ids,
+                          n_hash = 100,
+                          bands = 20,
+                          rows_per_band = 5,
+                          sim_threshold = 0.2,
+                          B = 5,
+                          mh_params) {
+  
+  # sanity check: n_hash matches mh_params
+  stopifnot(length(mh_params$a) == n_hash)
+  
+  N <- nrow(tv_df)
+  model_ids <- tv_df$modelID
+  results <- vector("list", B)
+  
+  for (b in seq_len(B)) {
+    cat("Bootstrap", b, "...\n")
+    
+    samp_idx <- sample(seq_len(N), size = N, replace = TRUE)
+    train_idx <- unique(samp_idx)
+    test_idx  <- setdiff(seq_len(N), train_idx)
+    
+    cat("Train:", length(train_idx),
+        "Test:", length(test_idx),
+        "(", round(length(train_idx) / N * 100, 1), "% train )\n")
+    
+    if (length(test_idx) < 2) {
+      cat("Too few test items; skipping bootstrap.\n")
+      next
+    }
+    
+    # Subset token IDs voor test set
+    token_ids_test <- tv_token_ids[test_idx]
+    
+    # MinHash op test subset
+    sig_b <- minhash_signature(
+      token_id_list = token_ids_test,
+      a = mh_params$a,
+      b = mh_params$b,
+      P = mh_params$P
+    )
+    
+    # LSH candidate pairs op lokale indices (1..|test_idx|)
+    cand_local <- lsh_candidate_pairs(sig_b, bands = bands, rows_per_band = rows_per_band)
+    
+    if (nrow(cand_local) == 0) {
+      cat("No candidate pairs found.\n")
+      next
+    }
+    
+    # MSM similarity op test subset (LET OP: global ids gebruiken)
+    test_to_global <- test_idx
+    cand_local <- cand_local %>%
+      mutate(
+        i_local = i,
+        j_local = j,
+        sim = map2_dbl(i_local, j_local, ~ {
+          id1 <- test_to_global[.x]
+          id2 <- test_to_global[.y]
+          msm_sim(id1, id2)
+        }),
+        pred_dup = sim >= sim_threshold
+      )
+    
+    metrics_b <- compute_metrics_for_test(
+      test_idx         = test_idx,
+      cand_pairs_local = cand_local,
+      token_ids_test   = token_ids_test,
+      modelID_global   = model_ids,
+      test_to_global   = test_to_global
+    )
+    
+    results[[b]] <- metrics_b %>% mutate(bootstrap = b)
+  }
+  
+  bind_rows(results)
+}
+
+##############################
+# 8. LSH tuning
+##############################
+
+tune_lsh <- function(tv_df,
+                     tv_token_ids,
+                     n_hash_values = c(100),
+                     bands_values  = c(10, 20, 25, 50),
+                     thresholds    = c(0.1, 0.2, 0.3),
+                     B = 3,
+                     mh_params) {
+  
+  grid <- tidyr::crossing(
+    n_hash        = n_hash_values,
+    bands         = bands_values,
+    sim_threshold = thresholds
+  ) %>%
+    mutate(
+      rows_per_band = n_hash / bands
+    ) %>%
+    filter(rows_per_band == floor(rows_per_band))
+  
+  message("Number of configs: ", nrow(grid))
+  
+  purrr::pmap_dfr(
+    grid,
+    function(n_hash, bands, sim_threshold, rows_per_band) {
+      message("Config: n_hash=", n_hash,
+              " bands=", bands,
+              " rows_per_band=", rows_per_band,
+              " threshold=", sim_threshold)
+      
+      bs <- run_bootstrap(
+        tv_df         = tv_df,
+        tv_token_ids  = tv_token_ids,
+        n_hash        = n_hash,
+        bands         = bands,
+        rows_per_band = rows_per_band,
+        sim_threshold = sim_threshold,
+        B             = B,
+        mh_params     = mh_params
+      )
+      
+      bs %>%
+        summarise(
+          avg_F1                  = mean(F1),
+          avg_F1_star             = mean(F1_star),
+          avg_pair_quality        = mean(pair_quality),
+          avg_pair_completeness   = mean(pair_completeness),
+          avg_comparison_fraction = mean(comparison_fraction)
+        ) %>%
+        mutate(
+          n_hash        = n_hash,
+          bands         = bands,
+          rows_per_band = rows_per_band,
+          sim_threshold = sim_threshold
+        ) %>%
+        relocate(n_hash, bands, rows_per_band, sim_threshold)
+    }
+  )
+}
+
+##############################
+# 9. Run tuning + final evaluation
+##############################
+
+tuning_results <- tune_lsh(
+  tv_df         = tv_df,
+  tv_token_ids  = tv_token_ids,
+  n_hash_values = c(100),
+  bands_values  = c(10, 20, 25, 50),
+  thresholds    = c(0.1, 0.2, 0.3),
+  B             = 3,
+  mh_params     = mh_params
+)
+
+tuning_results
+
+best_cfg <- tuning_results %>%
+  arrange(desc(avg_F1_star)) %>%  
+  slice(1)
+
+n_hash_best      <- best_cfg$n_hash
+bands_best       <- best_cfg$bands
+rows_per_band_bt <- best_cfg$rows_per_band
+sim_thr_best     <- best_cfg$sim_threshold
+
+bootstrap_results <- run_bootstrap(
+  tv_df         = tv_df,
+  tv_token_ids  = tv_token_ids,
+  n_hash        = n_hash_best,
+  bands         = bands_best,
+  rows_per_band = rows_per_band_bt,
+  sim_threshold = sim_thr_best,
+  B             = 5,
+  mh_params     = mh_params
+)
+
+bootstrap_results %>%
+  summarise(
+    avg_F1                  = mean(F1),
+    avg_F1_star             = mean(F1_star),
+    avg_pair_quality        = mean(pair_quality),
+    avg_pair_completeness   = mean(pair_completeness),
+    avg_comparison_fraction = mean(comparison_fraction)
+  )
+
+############# plots
+tuning_plot_df <- tuning_results %>%
+  select(
+    comparison_fraction = avg_comparison_fraction,
+    F1_star             = avg_F1_star
+  ) %>%
+  mutate(config_id = row_number()) %>%
+  pivot_longer(
+    cols = c(F1_star),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(tuning_plot_df,
+       aes(x = comparison_fraction, y = value, color = metric)) +
+  geom_point(size = 3) +
+  geom_line() +
+  scale_x_log10() +
+  labs(
+    x = "Fraction of comparisons (log-scale)",
+    y = "Metric value",
+    color = "Metric",
+    title = "Trade-off between comparison fraction and performance metrics (MSM)"
+  ) +
+  theme_minimal()
+
+bootstrap_plot_df <- bootstrap_results %>%
+  select(
+    bootstrap,
+    F1,
+    F1_star,
+    pair_quality,
+    pair_completeness,
+    comparison_fraction
+  ) %>%
+  pivot_longer(
+    cols = -bootstrap,
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(bootstrap_plot_df,
+       aes(x = metric, y = value)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  labs(
+    x = "Metric",
+    y = "Value",
+    title = "Bootstrap variability of the metrics (best LSH config, MSM)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+############################################################
+#   Curves
+############################################################
+
+library(ggplot2)
+library(dplyr)
+
+df <- tuning_results %>%
+  select(
+    comparison_fraction = avg_comparison_fraction,
+    PC = avg_pair_completeness
+  ) %>%
+  arrange(comparison_fraction)
+
+ggplot(df, aes(x = comparison_fraction, y = PC)) +
+  geom_line(size = 1) +             # CAiSE-style line
+  geom_point(size = 2) +            # small points on top
+  scale_x_continuous(
+    trans = "log10",
+    limits = c(min(df$comparison_fraction), 1)
+  ) +
+  labs(
+    x = "Fraction of comparisons",
+    y = "Pair Completeness",
+    title = "Pair Completeness vs Fraction of Comparisons"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+df <- tuning_results %>%
+  select(
+    comparison_fraction = avg_comparison_fraction,
+    PQ = avg_pair_quality
+  ) %>%
+  arrange(comparison_fraction)
+
+ggplot(df, aes(x = comparison_fraction, y = PQ)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(trans = "log10") +
+  labs(
+    x = "Fraction of comparisons",
+    y = "Pair Quality",
+    title = "Pair Quality vs Fraction of Comparisons"
+  ) +
+  theme_minimal()
+
+df <- tuning_results %>%
+  select(
+    comparison_fraction = avg_comparison_fraction,
+    F1star = avg_F1_star
+  ) %>%
+  arrange(comparison_fraction)
+
+ggplot(df, aes(x = comparison_fraction, y = F1star)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(trans = "log10") +
+  labs(
+    x = "Fraction of comparisons",
+    y = "F1*",
+    title = "F1* vs Fraction of Comparisons"
+  ) +
+  theme_minimal()
+
+df <- tuning_results %>%
+  select(
+    comparison_fraction = avg_comparison_fraction,
+    F1 = avg_F1
+  ) %>%
+  arrange(comparison_fraction)
+
+ggplot(df, aes(x = comparison_fraction, y = F1)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(trans = "log10") +
+  labs(
+    x = "Fraction of comparisons",
+    y = "F1",
+    title = "F1 vs Fraction of Comparisons"
+  ) +
+  theme_minimal()
+
+
