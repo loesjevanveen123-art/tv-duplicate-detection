@@ -372,7 +372,7 @@ run_pipeline_full <- function(path){
 
 
 ############################################################
-# ---- RUN ----
+# RUN 
 ############################################################
 
 json_path <- "/Users/loesvanveen/Downloads/TVs-all-merged.json"
@@ -381,9 +381,9 @@ best <- run_pipeline_full(json_path)
 
 print(best)
 
-# ---- FINAL REQUIRED BOOTSTRAP RUN (5 iterations) ----
+# FINAL REQUIRED BOOTSTRAP RUN (5 iterations)
 ############################################################
-# BOOTSTRAP PIPELINE (REQUIRED BY ASSIGNMENT)
+# BOOTSTRAP PIPELINE
 ############################################################
 
 bootstrap_pipeline <- function(path,
@@ -562,7 +562,7 @@ best_metrics$lsh_eval    # ← HIER STAAN PQ, PC, F1_star
 best_metrics$final_eval  # ← zou ongeveer F1 ≈ 0.44 moeten zijn
 
 ############################################################
-# F1 vs Fraction of Comparisons (zoals MSMP+ figuur)
+# F1 vs Fraction of Comparisons
 ############################################################
 
 lsh_f1_curve <- function(path,
@@ -649,10 +649,6 @@ lsh_f1_curve <- function(path,
   
   curve_df
 }
-
-############################################################
-# AANROEPEN
-############################################################
 
 curve_results <- lsh_f1_curve(
   path = json_path,
