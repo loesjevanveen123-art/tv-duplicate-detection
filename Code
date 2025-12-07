@@ -686,3 +686,124 @@ ggplot(curve_results, aes(x = fraction, y = F1)) +
     axis.title = element_text(size = 12)
   )
 
+############################################################
+# 10. LSH-STAGE PERFORMANCE CURVES (PQ, PC, F1*)
+############################################################
+
+lsh_stage_curve <- function(path,
+                            num_hashes = 100,
+                            bands_grid = c(2, 4, 5, 10, 20, 25, 50, 100),
+                            seed = 42) {
+  # 1) Data inladen + schoonmaken
+  df_raw <- load_tv_data(path)
+  df <- clean_tv_data(df_raw)
+  N <- nrow(df)
+  total_pairs <- choose(N, 2)
+  
+  # 2) Model words (title + values)
+  title_mw <- purrr::map(df$title_clean, extract_model_words_title)
+  value_mw <- purrr::map(df$features_clean, extract_model_words_values)
+  mw_sets  <- purrr::map2(title_mw, value_mw, ~ unique(c(.x, .y)))
+  
+  # 3) Vocab + MinHash
+  vocab <- build_vocabulary(mw_sets)
+  idx   <- build_indexed_sets(mw_sets, vocab)
+  mh    <- compute_minhash_signatures(idx$sets_idx, length(vocab),
+                                      num_hashes = num_hashes,
+                                      seed = seed)
+  S <- mh$S
+  
+  # 4) Gold pairs
+  gold <- compute_gold_duplicate_pairs(df$modelID)
+  
+  rows <- list()
+  
+  # 5) Bands → blocking quality
+  for (b in bands_grid) {
+    message("Bands = ", b)
+    
+    cp <- lsh_candidates(S, bands = b)
+    Nc <- nrow(cp)
+    fraction <- ifelse(total_pairs > 0, Nc / total_pairs, 0)
+    
+    lsh_ev <- evaluate_lsh_stage(cp, gold)
+    
+    rows[[length(rows) + 1]] <- tibble::tibble(
+      bands    = b,
+      fraction = fraction,
+      PQ       = lsh_ev$PQ,
+      PC       = lsh_ev$PC,
+      F1_star  = lsh_ev$F1_star,
+      Nc       = lsh_ev$Nc,
+      Df       = lsh_ev$Df,
+      Dn       = lsh_ev$Dn
+    )
+  }
+  
+  dplyr::bind_rows(rows) %>%
+    dplyr::arrange(fraction)
+}
+
+# Compute PQ / PC / F1* curves
+curve_lsh <- lsh_stage_curve(
+  path = json_path,
+  num_hashes = 100,
+  bands_grid = c(2, 4, 5, 10, 20, 25, 50, 100),
+  seed = 42
+)
+
+curve_lsh
+
+
+############################################################
+# PLOTS 
+############################################################
+
+# F1* Plot
+ggplot(curve_lsh, aes(x = fraction, y = F1_star)) +
+  geom_line(size = 0.6) +
+  geom_point(size = 1.5) +
+  scale_x_continuous(limits = c(0, 0.1)) +
+  scale_y_continuous(limits = c(0, 0.025)) +
+  labs(
+    title = expression(F[1]*"*" ~ "vs. Fraction of Comparisons"),
+    x = "Fraction of comparisons",
+    y = expression(F[1]*"*-measure")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+  )
+
+# PQ Plot
+ggplot(curve_lsh, aes(x = fraction, y = PQ)) +
+  geom_line(size = 0.6) +
+  geom_point(size = 1.5) +
+  scale_x_continuous(limits = c(0, 0.1)) +
+  scale_y_continuous(limits = c(0, 0.015)) +
+  labs(
+    title = "Pair Quality vs. Fraction of Comparisons",
+    x = "Fraction of comparisons",
+    y = "PQ (Pair Quality)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+  )
+
+# PC Plot
+ggplot(curve_lsh, aes(x = fraction, y = PC)) +
+  geom_line(size = 0.6) +
+  geom_point(size = 1.5) +
+  scale_x_continuous(limits = c(0, 0.1)) +
+  scale_y_continuous(limits = c(0.4, 0.8)) +
+  labs(
+    title = "Pair Completeness vs. Fraction of Comparisons",
+    x = "Fraction of comparisons",
+    y = "PC (Pair Completeness)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+  )
+
