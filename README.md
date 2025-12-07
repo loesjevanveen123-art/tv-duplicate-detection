@@ -250,3 +250,25 @@ Used to verify the tuned performance.
   - `F1`
 
 A ggplot is provided to generate a scientific-style curve.
+
+## 15. LSH Blocking Efficiency Curve
+
+**Function:** `lsh_stage_curve`
+
+- Varies only the **LSH band configuration**
+- For each band count:
+  - Runs LSH blocking
+  - Computes:
+    - **Pair Quality (PQ)**
+    - **Pair Completeness (PC)**
+    - **F1\*** (blocking efficiency)
+    - **Fraction of comparisons**
+- Returns a tibble with:
+  - `bands`
+  - `fraction`
+  - `PQ`
+  - `PC`
+  - `F1_star`
+
+Several ggplots are provided to visualise how blocking effectiveness changes with the number of retained comparisons.
+
