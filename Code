@@ -3,14 +3,14 @@
 # Includes:
 #  - Model-word extraction
 #  - Cleaning
-#  - MinHash (self-made)
-#  - LSH banding (self-made)
+#  - MinHash 
+#  - LSH banding
 #  - MSM similarity
 #  - FULL TUNING:
 #       * LSH bands
 #       * MSM threshold
 #       * MSM weights (kV, HSM, TMW)
-#  - Outputs BEST CONFIG FOR HIGHEST F1
+#  - Outputs 
 ############################################################
 
 library(jsonlite)
