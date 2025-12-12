@@ -513,7 +513,7 @@ evaluate_lsh_stage <- function(cp, gold){
 
 recompute_for_best <- function(path, best,
                                num_hashes = 100, seed = 42){
-  # 1) data inladen + schoonmaken
+  # 1) data + clean
   df_raw <- load_tv_data(path)
   df <- clean_tv_data(df_raw)
   N <- nrow(df)
@@ -531,11 +531,11 @@ recompute_for_best <- function(path, best,
                                       seed = seed)
   S <- mh$S
   
-  # 4) LSH met bands = best$bands
+  # 4) LSH with bands = best$bands
   cp   <- lsh_candidates(S, bands = best$bands)
   gold <- compute_gold_duplicate_pairs(df$modelID)
   
-  # 5) MSM scores met beste weights
+  # 5) MSM scores with best weights
   msm <- predict_msm(
     cp, df, title_mw, value_mw,
     w_kv  = best$w_kv,
@@ -543,11 +543,11 @@ recompute_for_best <- function(path, best,
     w_tmw = best$w_tmw
   )
   
-  # 6) threshold toepassen
+  # 6) threshold 
   pred <- msm %>% 
     mutate(pred_duplicate = msm_score >= best$threshold)
   
-  # 7) evaluaties
+  # 7) evaluations
   lsh_ev   <- evaluate_lsh_stage(cp, gold)    # PQ / PC / F1*
   final_ev <- evaluate_final(pred, gold, N)   # TP/FP/FN/TN + precision/recall/F1
   
@@ -558,8 +558,8 @@ recompute_for_best <- function(path, best,
 }
 best_metrics <- recompute_for_best(json_path, best)
 
-best_metrics$lsh_eval    # ← HIER STAAN PQ, PC, F1_star
-best_metrics$final_eval  # ← zou ongeveer F1 ≈ 0.44 moeten zijn
+best_metrics$lsh_eval    
+best_metrics$final_eval  
 
 ############################################################
 # F1 vs Fraction of Comparisons
@@ -579,12 +579,12 @@ lsh_f1_curve <- function(path,
   N <- nrow(df)
   total_pairs <- choose(N, 2)
   
-  # 2) Model words (title + values)
+  # 2) Model words 
   title_mw <- purrr::map(df$title_clean, extract_model_words_title)
   value_mw <- purrr::map(df$features_clean, extract_model_words_values)
   mw_sets  <- purrr::map2(title_mw, value_mw, ~ unique(c(.x, .y)))
   
-  # 3) Vocab + MinHash (één keer)
+  # 3) Vocab + MinHash
   vocab <- build_vocabulary(mw_sets)
   idx   <- build_indexed_sets(mw_sets, vocab)
   mh    <- compute_minhash_signatures(idx$sets_idx, length(vocab),
@@ -615,11 +615,11 @@ lsh_f1_curve <- function(path,
       next
     }
     
-    # MSM-scores voor deze bands + weights
+    # MSM-scores 
     msm <- predict_msm(cp, df, title_mw, value_mw,
                        w_kv = w_kv, w_hsm = w_hsm, w_tmw = w_tmw)
     
-    # Threshold-tuning voor deze bands
+    # Threshold-tuning
     best_F1 <- -1
     best_th <- NA_real_
     
@@ -637,7 +637,7 @@ lsh_f1_curve <- function(path,
   
   print(curve_df)
   
-  # 5) Plot (zoals figuur in paper)
+  # 5) Plot
   plot(curve_df$fraction, curve_df$F1,
        type = "l",
        xlab = "Fraction of comparisons",
@@ -664,8 +664,8 @@ curve_results <- lsh_f1_curve(
 curve_results
 
 ggplot(curve_results, aes(x = fraction, y = F1)) +
-  geom_line(size = 0.6) +              # dunnere lijn
-  geom_point(size = 1.5) +             # kleinere punten
+  geom_line(size = 0.6) +              
+  geom_point(size = 1.5) +             
   scale_x_continuous(
     limits = c(0, 0.10),
     breaks = seq(0, 0.10, 0.02)
@@ -675,7 +675,7 @@ ggplot(curve_results, aes(x = fraction, y = F1)) +
     breaks = seq(0.37, 0.46, 0.02)
   ) +
   labs(
-    title = "F1 vs. Fraction of Comparisons",   # titel toegevoegd
+    title = "F1 vs. Fraction of Comparisons",   
     x = "Fraction of comparisons",
     y = "F1-measure"
   ) +
@@ -694,13 +694,13 @@ lsh_stage_curve <- function(path,
                             num_hashes = 100,
                             bands_grid = c(2, 4, 5, 10, 20, 25, 50, 100),
                             seed = 42) {
-  # 1) Data inladen + schoonmaken
+ 
   df_raw <- load_tv_data(path)
   df <- clean_tv_data(df_raw)
   N <- nrow(df)
   total_pairs <- choose(N, 2)
   
-  # 2) Model words (title + values)
+  # 2) Model words 
   title_mw <- purrr::map(df$title_clean, extract_model_words_title)
   value_mw <- purrr::map(df$features_clean, extract_model_words_values)
   mw_sets  <- purrr::map2(title_mw, value_mw, ~ unique(c(.x, .y)))
