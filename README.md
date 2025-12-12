@@ -1,11 +1,56 @@
 # F1-Optimized MinHash–LSH + MSM Duplicate Detection Pipeline
 
 This repository implements a fully automatic duplicate-detection pipeline for the **TVs-all-merged** dataset.  
+The system combines **self-built MinHash**, **banded LSH**, and an **MSM similarity model**, followed by **F1-based tuning** and a **5× bootstrap evaluation**.
+
+---
+
+## 0. What This Project Is About
+
+This project focuses on developing a **scalable solution** for product duplicate detection in heterogeneous Web shop data.  
+Consumers rely on accurate product aggregation, yet product descriptions across online retailers often differ in terminology, formatting, attribute naming, and completeness. Because manual aggregation is infeasible, an automated approach is needed to determine when two product descriptions refer to the **same physical product**.
+
+A major challenge is scalability: comparing all possible product pairs becomes computationally infeasible as dataset size grows.  
+To address this, the assignment requires using **Locality-Sensitive Hashing (LSH)** to drastically reduce the number of comparisons while still retrieving the majority of true duplicates.
+
+The dataset used here consists of **1,624 televisions** collected from four Web shops (Amazon, Newegg, BestBuy, and TheNerds). Each product contains a title, multiple key–value attributes, and a `modelID` used only for evaluation. Since identifiers like modelID are often missing in real-world settings, the algorithm must detect duplicates **without relying on them**.
+
+The assignment emphasizes scalability over algorithmic complexity. Therefore, this project implements:
+
+- a **hybrid model-word representation** derived from titles and structured numeric attributes,  
+- a **self-built MinHash–LSH pipeline** to generate candidate pairs efficiently,  
+- a **weighted MSM similarity model** for classifying duplicates,  
+- evaluation using **pair quality**, **pair completeness**, **F1\***, and **F1**,  
+- and a **bootstrap procedure (5×)** to obtain robust averaged metrics.
+
+This pipeline aims to achieve strong F1 performance while comparing only a tiny fraction of all possible pairs.
+
+---
+
+## 0.1 Structure of the Code and How to Use the Code
+
+The repository is organised into modular R scripts:
+
+- `load_data.R` — data loading  
+- `cleaning.R` — text cleaning and unit normalisation  
+- `model_words.R` — extraction of hybrid model-word tokens  
+- `vocabulary_index.R` — vocabulary building and token indexing  
+- `minhash.R` — custom MinHash implementation  
+- `lsh.R` — banded LSH candidate generation  
+- `msm_similarity.R` — computation of MSM similarity scores  
+- `evaluation.R` — F1, PQ, PC, and related metrics  
+- `tuning.R` — grid search over LSH bands, MSM weights, and thresholds  
+- `bootstrap.R` — five-fold bootstrap evaluation  
+- `pipeline.R` — wrapper functions for running all stages
+
+This modular structure allows each stage of the pipeline to be run independently or combined as needed.
+Load the above scripts.
+This repository implements a fully automatic duplicate-detection pipeline for the **TVs-all-merged** dataset.  
 The system combines **self-built MinHash**, **banded LSH**, and an **MSM similarity model**, followed by **full F1-based tuning** and a **5× bootstrap evaluation**.
 
 ---
 
-##  1. Data Loading
+## 1. Data Loading
 
 **Function:** `load_tv_data(path)`  
 Loads the JSON file (`TVs-all-merged.json`) and extracts:
